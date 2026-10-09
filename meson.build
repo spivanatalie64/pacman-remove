@@ -1,6 +1,6 @@
 project('pacman',
         'c',
-        version : '7.1.0',
+        version : '7.1.0.dork1',
         license : 'GPLv2+',
         default_options : [
           'c_std=gnu99',
@@ -366,7 +366,7 @@ pkgconfig.generate(
 )
 
 pacman_bin = executable(
-  'pacman',
+  'pacman-remove',
   pacman_sources,
   include_directories : includes,
   link_with : [libalpm, libcommon],

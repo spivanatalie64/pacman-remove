@@ -223,6 +223,9 @@ static void usage(int op, const char * const myname)
 		addlist(_("      --gpgdir <path>  set an alternate home directory for GnuPG\n"));
 		addlist(_("      --logfile <path> set an alternate log file\n"));
 		addlist(_("      --noconfirm      do not ask for any confirmation\n"));
+		addlist(_("      --noconfirm_IknowwhatIamdoing\n"
+		          "                       pacman-remove: answer every prompt with 'y'\n"
+		          "                       and skip the first-use dork acknowledgment\n"));
 		addlist(_("      --confirm        always ask for confirmation\n"));
 		addlist(_("      --disable-download-timeout\n"
 		          "                       use relaxed timeouts for download\n"));
@@ -499,6 +502,11 @@ static int parsearg_global(int opt)
 			break;
 		case OP_CONFIRM:
 			config->noconfirm = 0;
+			break;
+		case OP_DORKFLAG:
+			/* pacman-remove: '-I' behavior is a no-confirm with automatic yes answers */
+			config->noconfirm = 1;
+			config->dorkflag = 1;
 			break;
 		case OP_DBPATH:
 		case 'b':
@@ -1011,6 +1019,7 @@ static int parseargs(int argc, char *argv[])
 		{"downloadonly", no_argument,     0, OP_DOWNLOADONLY},
 		{"refresh",    no_argument,       0, OP_REFRESH},
 		{"noconfirm",  no_argument,       0, OP_NOCONFIRM},
+		{"noconfirm_IknowwhatIamdoing", no_argument, 0, OP_DORKFLAG},
 		{"confirm",    no_argument,       0, OP_CONFIRM},
 		{"config",     required_argument, 0, OP_CONFIG},
 		{"ignore",     required_argument, 0, OP_IGNORE},
@@ -1280,6 +1289,12 @@ int main(int argc, char *argv[])
 
 	pm_printf(ALPM_LOG_DEBUG, "pacman v%s - libalpm v%s\n", PACKAGE_VERSION, alpm_version());
 
+	/* pacman-remove: allow $(...) / (...) target substitution on the command
+	 * line, e.g. -R '(pacman -Qq | grep mydorks)' */
+	if(expand_substitution_targets(&pm_targets) != 0) {
+		cleanup(EXIT_FAILURE);
+	}
+
 	/* parse the config file */
 	ret = parseconfig(config->configfile);
 	if(ret != 0) {
@@ -1298,6 +1313,11 @@ int main(int argc, char *argv[])
 		config->flags |= ALPM_TRANS_FLAG_NOLOCK;
 		/* Display only errors */
 		config->logmask &= ~ALPM_LOG_WARNING;
+	}
+
+	/* pacman-remove: first-run dork acknowledgment gate */
+	if(dork_gate() != 0) {
+		cleanup(EXIT_FAILURE);
 	}
 
 	if(config->verbose > 0) {

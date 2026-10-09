@@ -51,6 +51,7 @@ typedef struct __config_t {
 	unsigned short version;
 	unsigned short help;
 	unsigned short noconfirm;
+	unsigned short dorkflag;
 	unsigned short noprogressbar;
 	unsigned short logmask;
 	unsigned short print;
@@ -217,7 +218,8 @@ enum {
 	OP_DISABLEDLTIMEOUT,
 	OP_DISABLESANDBOX,
 	OP_DISABLESANDBOXFILESYSTEM,
-	OP_DISABLESANDBOXSYSCALLS
+	OP_DISABLESANDBOXSYSCALLS,
+	OP_DORKFLAG
 };
 
 /* clean method */

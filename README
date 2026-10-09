@@ -1,3 +1,61 @@
+pacman-remove
+=============
+
+`pacman-remove` is a fork of pacman (upstream `pacman.git @ v7.1.0-9-g54d9411`)
+for people who made the pacman developers type every package name
+(the other way around was deemed unfair), and who therefore
+deserve a fair confirmation policy with a very forgiving default answer.
+
+Behavior (this fork only, plain pacman is not affected):
+
+1. The first time you run anything that can change the system (`-R`, `-S`
+   without search/info flags, `-U`, `-D`), you are shown:
+
+       I am a dork, and I am using this because the Pacman developers were
+       mean and made us type every package name
+
+   and asked `Do you accept? [y/N]`. Pressing enter politely tells you
+   `no`. The answer is recorded in `<DBPath>/.pacman-remove-consent` once
+   you type `y`, so interactive users only ever get asked once.
+   Read-only operations (`-Q*`, `-Ss`, `-Si`, `-Fl`, `--print`) skip the gate.
+
+2. Every yes/no confirmation defaults to **n** (`[y/N]`). Enter = no.
+   If the pacman developers want a change to happen, you will type that
+   decision out like an adult.
+
+3. `--noconfirm` no longer auto-answers yes. It is refused at the gate with
+   a hint to the spelling below, because scripting while dodging the dork
+   question is still dorking.
+
+4. `--noconfirm_IknowwhatIamdoing` is the escape hatch: it records the
+   acknowledgment silently and answers every prompt with `y` — the scripted
+   equivalent of piping `yes |`. Pipelines like `yes | pacman-remove` that
+   try to consent on a human's behalf are rejected instead.
+
+5. Package list substitution: arguments wrapped in `$(...)` or `(...)`
+   run through `sh -c`, and each output line becomes a package name:
+
+       sudo pacman-remove -R '(sudo pacman -Ss | grep mate)'
+       sudo pacman-remove -R "$(pacman-remove -Qq | grep nobody-needs-this)"
+       sudo pacman-remove -Rs '(pacman-remove -Qdtq)'
+
+   Descriptions, versions, `[installed]` markers and color codes in the
+   output are ignored; only the package name token of each line is used.
+
+Building
+--------
+
+    meson setup build -Ddoc=disabled
+    ninja -C build
+    # binary: build/pacman-remove (self-contained, libalpm linked statically)
+
+Install just the binary so it coexists with your distro's pacman:
+
+    install -m755 build/pacman-remove /usr/local/bin/pacman-remove
+
+The binary keeps upstream's full behavior apart from the five points above,
+so `sudo pacman-remove ...(anything pacman accepts)...` works as usual.
+
 ALPM library overview & internals
 =================================
 

@@ -32,6 +32,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <limits.h>
+#include <sys/wait.h> /* WEXITSTATUS/popen subprocess status */
 #include <wchar.h>
 #include <wctype.h>
 #include <ctype.h>
@@ -1735,7 +1736,10 @@ static int question(short preset, const char *format, va_list args)
 
 	if(config->noconfirm) {
 		fprintf(stream, "\n");
-		return preset;
+		/* pacman-remove: without the dork flag, --noconfirm stands for
+		 * "no to everything" (n is the default); WITH the flag, every
+		 * question is answered 'y' automatically (scripted 'yes |') */
+		return config->dorkflag ? 1 : 0;
 	}
 
 	flush_term_input(fd_in);
@@ -1767,7 +1771,8 @@ int yesno(const char *format, ...)
 	va_list args;
 
 	va_start(args, format);
-	ret = question(1, format, args);
+	/* pacman-remove: "n" is the default answer for every yes/no prompt */
+	ret = question(0, format, args);
 	va_end(args);
 
 	return ret;
@@ -1980,4 +1985,359 @@ char *resolve_path(const char *path, const char *option)
 	}
 
 	return resolved;
+}
+
+/* --- pacman-remove (dork edition) ------------------------------------------------ */
+
+#define DORK_CONSENT_BASENAME ".pacman-remove-consent"
+#define DORK_CONSENT_TEXT "dork acknowledged\n"
+
+static char *dork_consent_path(void)
+{
+	const char *dbpath;
+	char *path;
+	size_t len;
+
+	dbpath = alpm_option_get_dbpath(config->handle);
+	if(dbpath == NULL) {
+		dbpath = "/var/lib/pacman/";
+	}
+
+	len = strlen(dbpath) + strlen(DORK_CONSENT_BASENAME) + 2;
+	path = malloc(len);
+	if(path == NULL) {
+		pm_printf(ALPM_LOG_ERROR, _("failed to allocate string\n"));
+		return NULL;
+	}
+
+	if(dbpath[strlen(dbpath) - 1] == '/') {
+		snprintf(path, len, "%s%s", dbpath, DORK_CONSENT_BASENAME);
+	} else {
+		snprintf(path, len, "%s/%s", dbpath, DORK_CONSENT_BASENAME);
+	}
+
+	return path;
+}
+
+static int dork_write_consent(void)
+{
+	char *path;
+	FILE *fp;
+
+	path = dork_consent_path();
+	if(path == NULL) {
+		return -1;
+	}
+
+	fp = fopen(path, "w");
+	if(fp == NULL) {
+		pm_printf(ALPM_LOG_WARNING, _("failed to record the dork acknowledgment at '%s': %s\n"),
+				path, strerror(errno));
+		free(path);
+		return -1;
+	}
+	fputs(DORK_CONSENT_TEXT, fp);
+	fclose(fp);
+	free(path);
+	return 0;
+}
+
+/** pacman-remove: force a one-time dork acknowledgment before any operation
+ * that can change the system. Read-only operations pass untouched. */
+int dork_gate(void)
+{
+	char *path;
+	FILE *fp;
+
+	/* operations that cannot change the system are never gated */
+	switch(config->op) {
+		case PM_OP_REMOVE:
+		case PM_OP_UPGRADE:
+		case PM_OP_DATABASE:
+			break;
+		case PM_OP_SYNC:
+			if(config->print || config->op_s_search || config->op_s_info ||
+					config->group || config->op_q_list ||
+					config->op_s_downloadonly) {
+				return 0;
+			}
+			break;
+		default:
+			return 0;
+	}
+
+	/* the escape flag records the confession quietly and answers every
+	 * prompt with 'y' (the scripted equivalent of piping 'yes |') */
+	if(config->dorkflag) {
+		dork_write_consent();
+		return 0;
+	}
+
+	path = dork_consent_path();
+	if(path != NULL) {
+		fp = fopen(path, "r");
+		if(fp != NULL) {
+			fclose(fp);
+			free(path);
+			return 0;
+		}
+		free(path);
+	}
+
+	/* plain --noconfirm cannot buy its way past the acknowledgment */
+	if(config->noconfirm) {
+		pm_printf(ALPM_LOG_ERROR,
+				_("--noconfirm does not work in pacman-remove (n is the default answer). callers who want an automatic 'y' to every prompt must use --noconfirm_IknowwhatIamdoing.\n"));
+		return -1;
+	}
+
+	/* piped 'yes |' attempts cannot consent on a human's behalf */
+	if(!isatty(fileno(stdin))) {
+		pm_printf(ALPM_LOG_ERROR,
+				_("stdin is not a terminal, so the dork acknowledgment cannot be asked for. Use --noconfirm_IknowwhatIamdoing to accept on behalf of the script.\n"));
+		return -1;
+	}
+
+	colon_printf(_("I am a dork, and I am using this because the Pacman developers were mean and made us type every package name\n"));
+	if(noyes(_("Do you accept?")) == 0) {
+		pm_printf(ALPM_LOG_ERROR, _("Consent not given. Come back when you are ready to admit what you are.\n"));
+		return -1;
+	}
+
+	dork_write_consent();
+	return 0;
+}
+
+/* --- pacman-remove: $(...) and (...) target substitution -------------------------- */
+
+static void dork_strip_ansi(char *s)
+{
+	const char *r = s;
+	char *w = s;
+
+	while(r[0] != '\0') {
+		if(r[0] == 0x1B) {
+			if(r[1] == '[') {
+				/* CSI-style sequence: skip up to the final byte */
+				r += 2;
+				while(r[0] >= '@' && r[0] <= '~') {
+					r++;
+				}
+				continue;
+			} else if(r[1] == '\0') {
+				break; /* stray escape at end of string */
+			} else {
+				/* other escape; skip the escape byte and its neighbor */
+				r += 2;
+				continue;
+			}
+		}
+		*w++ = *r++;
+	}
+	*w = '\0';
+}
+
+static int dork_line_target(alpm_list_t **targets, char *line)
+{
+#define DORK_TARGET_MAX 128
+	char tok[DORK_TARGET_MAX];
+	const char *p;
+	size_t i;
+	int alnum = 0;
+
+	while(*line == ' ' || *line == '\t') {
+		line++;
+	}
+	dork_strip_ansi(line);
+	if(*line == '\0') {
+		return 0;
+	}
+
+	/* a package name ends at the first whitespace; anything else on
+	 * pacman listings (versions, [installed] markers) is ignored */
+	for(i = 0; i < DORK_TARGET_MAX && line[i] != '\0' &&
+			line[i] != ' ' && line[i] != '\t' &&
+			line[i] != '\n' && line[i] != '\r'; i++) {}
+
+	if(i == 0 || i >= DORK_TARGET_MAX) {
+		return 0;
+	}
+
+	memcpy(tok, line, i);
+	tok[i] = '\0';
+
+	/* strip a repository prefix (repo/name listings) */
+	if((p = strrchr(tok, '/')) != NULL) {
+		p++;
+	} else {
+		p = tok;
+	}
+	if(*p == '\0') {
+		return 0;
+	}
+
+	/* only look like a package name: alnum plus '@', '.', '_', '+', '-' */
+	for(i = 0; p[i] != '\0'; i++) {
+		if(isalnum((unsigned char)p[i])) {
+			alnum = 1;
+			continue;
+		}
+		if(p[i] == '@' || p[i] == '.' || p[i] == '_' ||
+				p[i] == '+' || p[i] == '-') {
+			continue;
+		}
+		return 0;
+	}
+	if(!alnum) {
+		return 0;
+	}
+
+	if(alpm_list_find_str(*targets, p) != NULL) {
+		return 1;
+	}
+
+	if(alpm_list_append_strdup(targets, p) == NULL) {
+		pm_printf(ALPM_LOG_ERROR, _("failed to allocate string\n"));
+		return -1;
+	}
+	return 1;
+#undef DORK_TARGET_MAX
+}
+
+static int dork_run_subst(const char *cmd, alpm_list_t **added)
+{
+	char *buffer = NULL;
+	size_t buffer_size = 0;
+	ssize_t nread;
+	FILE *fp;
+	int status;
+
+	fp = popen(cmd, "r");
+	if(fp == NULL) {
+		pm_printf(ALPM_LOG_ERROR, _("failed to run substitution command '%s': %s\n"),
+				cmd, strerror(errno));
+		return -1;
+	}
+
+	while((nread = getline(&buffer, &buffer_size, fp)) != -1) {
+		if(nread > 0 && buffer[nread - 1] == '\n') {
+			buffer[nread - 1] = '\0';
+		}
+		if(alpm_list_count(*added) >= 4096) {
+			pm_printf(ALPM_LOG_ERROR, _("substitution '%s' produced too many package names\n"), cmd);
+			free(buffer);
+			pclose(fp);
+			return -1;
+		}
+		if(dork_line_target(added, buffer) < 0) {
+			free(buffer);
+			pclose(fp);
+			return -1;
+		}
+	}
+	free(buffer);
+
+	if(ferror(fp)) {
+		pm_printf(ALPM_LOG_ERROR, _("failed to read substitution output from '%s'\n"), cmd);
+		pclose(fp);
+		return -1;
+	}
+
+	status = pclose(fp);
+	if(status == -1) {
+		pm_printf(ALPM_LOG_ERROR, _("failed to finish substitution command '%s': %s\n"),
+				cmd, strerror(errno));
+		return -1;
+	}
+	if(WEXITSTATUS(status) != 0 && alpm_list_count(*added) == 0) {
+		pm_printf(ALPM_LOG_ERROR, _("substitution command '%s' exited with %d and produced no package names\n"),
+				cmd, WEXITSTATUS(status));
+		return -1;
+	}
+
+	return 0;
+}
+
+static int dork_extract_command(const char *target, char **out)
+{
+	const char *start, *p;
+	size_t depth;
+
+	*out = NULL;
+
+	if(strncmp(target, "$(", 2) == 0) {
+		start = target + 2;
+	} else if(target[0] == '(') {
+		start = target + 1;
+	} else {
+		return 0;
+	}
+
+	/* find the balancing close paren */
+	depth = 1;
+	for(p = start; *p != '\0' && depth > 0; p++) {
+		if(*p == '\\') {
+			if(p[1] != '\0') {
+				p++;
+			}
+		} else if(*p == '(') {
+			depth++;
+		} else if(*p == ')') {
+			depth--;
+		}
+	}
+
+	if(depth != 0) {
+		pm_printf(ALPM_LOG_ERROR, _("unbalanced parentheses in target '%s'\n"), target);
+		return -1;
+	}
+
+	*out = strndup(start, p - start - 1);
+	if(*out == NULL) {
+		pm_printf(ALPM_LOG_ERROR, _("failed to allocate string\n"));
+		return -1;
+	}
+
+	return 1;
+}
+
+/** pacman-remove: turn arguments wrapped in $(...) or (...) into package
+ * names by running the wrapped command and parsing each output line. */
+int expand_substitution_targets(alpm_list_t **targets)
+{
+	alpm_list_t *it, *next, *added = NULL;
+	int any = 0;
+
+	for(it = *targets; it; it = next) {
+		char *cmd = NULL;
+		int r;
+
+		next = alpm_list_next(it);
+
+		r = dork_extract_command(it->data, &cmd);
+		if(r == 0) {
+			continue;
+		}
+		if(dork_run_subst(cmd, &added) != 0) {
+			free(cmd);
+			FREELIST(added);
+			return -1;
+		}
+		any = 1;
+		free(cmd);
+	}
+
+	if(!any) {
+		return 0;
+	}
+
+	if(alpm_list_count(added) == 0) {
+		pm_printf(ALPM_LOG_ERROR, _("no package names were produced by the target substitution\n"));
+		FREELIST(added);
+		return -1;
+	}
+
+	alpm_list_free_inner(*targets, free); alpm_list_free(*targets);
+	*targets = added;
+	return 0;
 }

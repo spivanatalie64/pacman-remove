@@ -79,6 +79,8 @@ int multiselect_question(char *array, int count);
 int colon_printf(const char *format, ...) __attribute__((format(printf, 1, 2)));
 int yesno(const char *format, ...) __attribute__((format(printf, 1, 2)));
 int noyes(const char *format, ...) __attribute__((format(printf, 1, 2)));
+int dork_gate(void);
+int expand_substitution_targets(alpm_list_t **targets);
 char *arg_to_string(int argc, char *argv[]);
 char *safe_fgets_stdin(char *s, int size);
 void console_cursor_hide(void);
